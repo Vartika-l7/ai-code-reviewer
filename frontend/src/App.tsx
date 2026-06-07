@@ -440,14 +440,14 @@ export default function App() {
       }
     }
     return {
-      'copy-code-button': 'Unassigned',
-      'secret-scanning-rules': 'Unassigned',
-      'api-documentation': 'Unassigned',
-      'persist-assignments': 'Unassigned',
+      'copy-code-button': 'Siddharth-iang',
+      'secret-scanning-rules': 'Siddharth-iang',
+      'api-documentation': 'skhazi123',
+      'persist-assignments': 'bhavyaxtech',
       'theme-toggle': 'Unassigned',
-      'file-filter-search': 'Unassigned',
-      'html-report-exporter': 'Unassigned',
-      'complexity-metrics': 'Unassigned'
+      'file-filter-search': 'nikita-sdev',
+      'html-report-exporter': 'A-R-Narke',
+      'complexity-metrics': 'Nikitasoni22'
     };
   });
 
