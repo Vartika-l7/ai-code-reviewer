@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import crypto from 'crypto';
 import dotenv from 'dotenv';
 import { exec } from 'child_process';
 import path from 'path';
@@ -16,9 +17,15 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Enable CORS and JSON parsing
+// Enable CORS
 app.use(cors());
-app.use(express.json());
+
+// Capture raw body for webhook signature verification before JSON parsing
+app.use(express.json({
+  verify: (req, _res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 
 // Ensure temp_repos folder exists
 const tempReposDir = path.join(__dirname, 'temp_repos');
@@ -587,8 +594,29 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
+function verifyWebhookSignature(rawBody, signature, secret) {
+  if (!signature || !secret) return false;
+  const sig = signature.startsWith('sha256=') ? signature : `sha256=${signature}`;
+  const hmac = crypto.createHmac('sha256', secret);
+  const digest = `sha256=${hmac.update(rawBody || '').digest('hex')}`;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(digest));
+  } catch {
+    return false;
+  }
+}
+
 // 🟢 Route: GitHub Webhook Receiver for automated Pull Request Reviews
 app.post('/api/webhook', async (req, res) => {
+  const webhookSecret = process.env.WEBHOOK_SECRET;
+  if (webhookSecret) {
+    const signature = req.headers['x-hub-signature-256'];
+    if (!verifyWebhookSignature(req.rawBody, signature, webhookSecret)) {
+      console.warn('❌ Webhook signature verification failed');
+      return res.status(401).json({ error: 'Invalid webhook signature' });
+    }
+  }
+
   const event = req.headers['x-github-event'];
   const payload = req.body;
 
