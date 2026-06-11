@@ -278,6 +278,7 @@ app.post('/api/analyze', async (req, res) => {
         
         if (aiResponse.ok) {
           reviewResult = await aiResponse.json();
+          reviewResult._mock = false;
         } else {
           throw new Error('AI engine responded with error');
         }
@@ -390,7 +391,7 @@ app.post('/api/chat', async (req, res) => {
     
     // Simple local fallback if Python FastAPI server is offline
     const responseMessage = `[Fallback Response] I see you are asking about: "${message}". Currently, the FastAPI AI Engine is offline, so I cannot analyze the full codebase for your query. Please make sure the AI Engine service is running on port 8000.`;
-    return res.json({ response: responseMessage, sessionId });
+    return res.json({ response: responseMessage, sessionId, _mock: true, _mockWarning: 'AI Engine unavailable. Fallback response generated.' });
   }
 });
 
@@ -699,7 +700,9 @@ Generated automatically by **RepoSage AI Generator**.`;
   return {
     fileReviews: reviews,
     generatedReadme: mockReadme,
-    mermaidDiagram: mockMermaid
+    mermaidDiagram: mockMermaid,
+    _mock: true,
+    _mockWarning: 'AI Engine unavailable. These findings are placeholder suggestions and may not reflect actual code.'
   };
 }
 
