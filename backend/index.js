@@ -486,20 +486,39 @@ app.post('/api/issues/create', async (req, res) => {
     return res.status(400).json({ error: 'GITHUB_PAT is not configured in backend/.env.' });
   }
 
-  if (!repoUrl || !title || !body) {
-    return res.status(400).json({ error: 'Repository URL, title, and body are required.' });
+  if (!title || typeof title !== 'string' || title.length < 1 || title.length > 256) {
+    return res.status(400).json({ error: 'Title is required and must be 1-256 characters.' });
+  }
+  if (!body || typeof body !== 'string' || body.length < 1 || body.length > 65536) {
+    return res.status(400).json({ error: 'Body is required and must be 1-65536 characters.' });
+  }
+  if (!Array.isArray(labels)) {
+    return res.status(400).json({ error: 'Labels must be an array.' });
+  }
+  if (labels.length > 10) {
+    return res.status(400).json({ error: 'Maximum 10 labels allowed.' });
+  }
+  for (const label of labels) {
+    if (typeof label !== 'string' || label.length > 50) {
+      return res.status(400).json({ error: 'Each label must be a string of at most 50 characters.' });
+    }
   }
 
   try {
-    // Extract owner and repo from URL (e.g., https://github.com/owner/repo)
-    const cleanUrl = repoUrl.replace('.git', '').replace(/\/$/, '');
-    const parts = cleanUrl.split('/');
-    const repo = parts.pop();
-    const owner = parts.pop();
-
-    if (!owner || !repo) {
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(repoUrl);
+    } catch {
+      return res.status(400).json({ error: 'Invalid GitHub repository URL.' });
+    }
+    if (parsedUrl.hostname !== 'github.com') {
+      return res.status(400).json({ error: 'URL must be a github.com repository.' });
+    }
+    const pathParts = parsedUrl.pathname.replace(/\.git$/, '').replace(/\/$/, '').split('/').filter(Boolean);
+    if (pathParts.length < 2) {
       return res.status(400).json({ error: 'Invalid GitHub repository URL structure.' });
     }
+    const [owner, repo] = pathParts;
 
     const octokit = new Octokit({ auth: token });
     
