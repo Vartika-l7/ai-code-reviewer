@@ -58,6 +58,16 @@ if (!fs.existsSync(tempReposDir)) {
   fs.mkdirSync(tempReposDir, { recursive: true });
 }
 
+// Clean up temp_repos on process exit to avoid leftover clones
+function cleanupTempRepos() {
+  if (fs.existsSync(tempReposDir)) {
+    fs.rmSync(tempReposDir, { recursive: true, force: true });
+  }
+}
+process.on('SIGINT', () => { cleanupTempRepos(); process.exit(0); });
+process.on('SIGTERM', () => { cleanupTempRepos(); process.exit(0); });
+process.on('exit', cleanupTempRepos);
+
 // Session-isolated repository contexts for chat functionality (issue #59)
 const repoContexts = new Map();
 const CONTEXT_TTL = 30 * 60 * 1000; // 30 minutes
