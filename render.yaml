@@ -1,0 +1,32 @@
+services:
+  # ----------------------------------------
+  # ⚙️ Node.js Backend Service
+  # ----------------------------------------
+  - type: web
+    name: reposage-backend
+    env: node
+    buildCommand: "cd backend && npm install"
+    startCommand: "cd backend && npm start"
+    envVars:
+      - key: NODE_ENV
+        value: "production"
+      # These variables must be set manually in the Render dashboard
+      - key: GROQ_API_KEY
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+
+  # ----------------------------------------
+  # 🧠 Python AI Engine Service
+  # ----------------------------------------
+  - type: web
+    name: reposage-ai-engine
+    env: python
+    buildCommand: "cd ai-engine && pip install -r requirements.txt"
+    startCommand: "cd ai-engine && uvicorn app:app --host 0.0.0.0 --port 10000"
+    envVars:
+      - key: PORT
+        value: "10000"
+      # This variable must be set manually in the Render dashboard
+      - key: GROQ_API_KEY
+        sync: false
