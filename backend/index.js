@@ -1,26 +1,62 @@
 import express from 'express';
 import cors from 'cors';
+import PDFDocument from 'pdfkit';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
-import { exec } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { Octokit } from '@octokit/rest';
-import PDFDocument from 'pdfkit';
-import { scanSecrets, scanSecretsInChanges } from './utils/secretsScanner.js';
 import { requireApiKey } from './utils/authMiddleware.js';
+import rateLimit from 'express-rate-limit';
+import { scanSecrets, scanSecretsInChanges } from './utils/secretsScanner.js';
+import { loadIgnorePatterns, readFilesRecursively } from './utils/ignoreHelper.js';
+import { isValidRepoUrl, parseRepoUrl } from './utils/urlValidator.js';
+import simpleGit from 'simple-git';
+import escapeHtml from 'lodash.escape';
+import { parseDiff } from './utils/diffParser.js';
+import { analyzeComplexity } from './utils/complexityAnalyzer.js';
+import { deleteFolderRecursive, getFolderSize } from './utils/fileHelper.js';
+import { verifyWebhookSignature } from './utils/signatureVerifier.js';
+import { verifyPort } from './utils/envVerifier.js';
+import { mockAIReview } from './utils/mockAIReview.js';
+import Analytics from './models/Analytics.js';
+import { connectDatabase } from './config/db.js';
 
 dotenv.config();
+
+connectDatabase();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = verifyPort(process.env.PORT || 5000);
 
-// Enable CORS
-app.use(cors());
+// Enable CORS with explicit origin
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000,http://localhost:5173').split(',');
+app.use(cors({
+  origin: ALLOWED_ORIGINS,
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'x-api-key'],
+  credentials: true
+}));
+
+// Per-IP rate limiting for expensive endpoints
+const analyzeLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many analyze requests. Please slow down and retry after 5 minutes.' }
+});
+const chatLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many chat requests. Please slow down and retry after 1 minute.' }
+});
 
 // Capture raw body for webhook signature verification before JSON parsing
 app.use(express.json({
@@ -35,291 +71,111 @@ if (!fs.existsSync(tempReposDir)) {
   fs.mkdirSync(tempReposDir, { recursive: true });
 }
 
-// Global variable to cache the active repository context for chat functionality
-let activeRepositoryContext = null;
-
-// 🟢 Helper to load .reposageignore patterns from a directory
-function loadIgnorePatterns(dir) {
-  const patterns = [];
-  const ignoreFile = path.join(dir, '.reposageignore');
-  if (fs.existsSync(ignoreFile)) {
-    const content = fs.readFileSync(ignoreFile, 'utf-8');
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (trimmed && !trimmed.startsWith('#')) {
-        patterns.push(trimmed);
-      }
-    }
-  }
-  return patterns;
-}
-
-// 🟢 Helper to check if a path matches any ignore pattern
-function isIgnored(filePath, patterns, baseDir) {
-  const relative = path.relative(baseDir, filePath);
-  for (const pattern of patterns) {
-    if (pattern.endsWith('/')) {
-      if (relative === pattern.slice(0, -1) || relative.startsWith(pattern)) {
-        return true;
-      }
-    } else if (pattern.startsWith('*.')) {
-      if (relative.endsWith(pattern.slice(1))) {
-        return true;
-      }
-    } else if (pattern.includes('*')) {
-      const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*');
-      try {
-        if (new RegExp(`^${escaped}$`).test(relative)) return true;
-      } catch { /* skip invalid pattern */ }
-    } else {
-      if (relative === pattern || relative.startsWith(pattern + '/') || relative.startsWith(pattern + path.sep)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-// 🟢 Helper to recursively read files
-function readFilesRecursively(dir, fileList = [], baseDir = dir, ignorePatterns = []) {
-  const files = fs.readdirSync(dir);
-  for (const file of files) {
-    const filePath = path.join(dir, file);
-    const stat = fs.statSync(filePath);
-
-    // Skip node_modules, git directories, and build artifacts
-    if (file === 'node_modules' || file === '.git' || file === 'dist' || file === 'build') {
-      continue;
-    }
-
-    // Skip .reposageignore itself and any ignored paths
-    if (file === '.reposageignore' || isIgnored(filePath, ignorePatterns, baseDir)) {
-      continue;
-    }
-
-    if (stat.isDirectory()) {
-      readFilesRecursively(filePath, fileList, baseDir, ignorePatterns);
-    } else {
-      // Analyze only source code files (Python, JS, TS, HTML, CSS, Go, Rust, Java, C++, PHP, Ruby, SQL)
-      const ext = path.extname(file).toLowerCase();
-      const validExtensions = ['.js', '.jsx', '.ts', '.tsx', '.py', '.java', '.go', '.rs', '.cpp', '.h', '.cs', '.php', '.rb', '.sql', '.html', '.css'];
-      
-      if (validExtensions.includes(ext)) {
-        try {
-          const content = fs.readFileSync(filePath, 'utf-8');
-          fileList.push({
-            name: path.relative(baseDir, filePath).replace(/\\/g, '/'),
-            content: content
-          });
-        } catch (e) {
-          console.warn(`Could not read file: ${filePath}`, e.message);
-        }
-      }
-    }
-  }
-  return fileList;
-}
-
-
-// Note: scanSecrets function has been refactored and imported from ./utils/secretsScanner.js
-
-// 🟢 Helper to parse git diff for webhook changes
-function parseDiff(diffStr) {
-  const files = [];
-  const lines = diffStr.split('\n');
-  let currentFile = null;
-  let currentLineInNewFile = 0;
-
-  for (const line of lines) {
-    if (line.startsWith('diff --git')) {
-      const match = line.match(/b\/(.+)$/);
-      if (match) {
-        currentFile = {
-          path: match[1],
-          changes: []
-        };
-        files.push(currentFile);
-      }
-    } else if (line.startsWith('@@ ')) {
-      const match = line.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-      if (match) {
-        currentLineInNewFile = parseInt(match[1], 10);
-      }
-    } else if (currentFile) {
-      if (line.startsWith('+') && !line.startsWith('+++')) {
-        currentFile.changes.push({
-          line: currentLineInNewFile,
-          content: line.slice(1)
-        });
-        currentLineInNewFile++;
-      } else if (line.startsWith(' ')) {
-        currentLineInNewFile++;
-      }
-    }
-  }
-  return files;
-}
-
-
-// Note: scanSecretsInChanges function has been refactored and imported from ./utils/secretsScanner.js
-
-// 🟢 Helper to analyze static complexity of source files
-function analyzeComplexity(fileContent, filePath) {
-  const lines = fileContent.split('\n');
-  const totalLines = lines.length;
-  let emptyLines = 0;
-  let commentLines = 0;
-  let functionCount = 0;
-
-  const ext = path.extname(filePath).toLowerCase();
-
-  // Languages that use C-style block comments /* ... */
-  const cStyleExts = ['.js', '.jsx', '.ts', '.tsx', '.java', '.cpp', '.h', '.cs', '.go', '.rs', '.php', '.css'];
-  const usesCStyleBlocks = cStyleExts.includes(ext);
-  const usesHtmlBlocks = (ext === '.html');
-  let inBlockComment = false;
-
-  lines.forEach(line => {
-    const trimmed = line.trim();
-
-    // Empty line detection
-    if (trimmed === '') {
-      emptyLines++;
-      return;
-    }
-
-    // --- Comment Detection with multi-line block tracking ---
-
-    if (usesCStyleBlocks) {
-      // Currently inside a /* ... */ block comment
-      if (inBlockComment) {
-        commentLines++;
-        if (trimmed.includes('*/')) {
-          inBlockComment = false;
-        }
-        return;
-      }
-
-      // Single-line comment: //
-      if (trimmed.startsWith('//')) {
-        commentLines++;
-      }
-      // Single-line block comment: /* ... */ on same line
-      else if (trimmed.startsWith('/*') && trimmed.includes('*/')) {
-        commentLines++;
-      }
-      // Multi-line block comment opening: /*
-      else if (trimmed.startsWith('/*')) {
-        commentLines++;
-        inBlockComment = true;
-      }
-      // Line starting with * inside a doc-comment block (e.g. JSDoc)
-      else if (trimmed.startsWith('*')) {
-        commentLines++;
-      }
-    } else if (ext === '.py' || ext === '.rb') {
-      if (trimmed.startsWith('#')) {
-        commentLines++;
-      }
-    } else if (ext === '.sql') {
-      if (inBlockComment) {
-        commentLines++;
-        if (trimmed.includes('*/')) {
-          inBlockComment = false;
-        }
-        return;
-      }
-      if (trimmed.startsWith('--')) {
-        commentLines++;
-      } else if (trimmed.startsWith('/*') && trimmed.includes('*/')) {
-        commentLines++;
-      } else if (trimmed.startsWith('/*')) {
-        commentLines++;
-        inBlockComment = true;
-      }
-    } else if (usesHtmlBlocks) {
-      if (trimmed.startsWith('<!--')) {
-        commentLines++;
-      }
-    }
-
-    // --- Function Detection ---
-    if (['.js', '.jsx', '.ts', '.tsx'].includes(ext)) {
-      if (trimmed.includes('function ') || trimmed.includes('=>') || /^\s*(?:async\s+)?\w+\s*\([^)]*\)\s*\{/g.test(trimmed)) {
-        functionCount++;
-      }
-    } else if (ext === '.py') {
-      if (trimmed.startsWith('def ')) {
-        functionCount++;
-      }
-    } else if (ext === '.go') {
-      if (trimmed.startsWith('func ')) {
-        functionCount++;
-      }
-    } else if (['.java', '.cpp', '.cs'].includes(ext)) {
-      if (/(?:public|private|protected|static|\w+)\s+\w+\s*\([^)]*\)\s*(?:\{|const)?/g.test(trimmed)) {
-        functionCount++;
-      }
-    }
-  });
-
-  const codeLines = totalLines - emptyLines - commentLines;
-  const complexityScore = Math.round((totalLines / 25) + (functionCount * 3));
-  let grade = 'A';
-  if (complexityScore > 40) grade = 'F';
-  else if (complexityScore > 25) grade = 'D';
-  else if (complexityScore > 15) grade = 'C';
-  else if (complexityScore > 8) grade = 'B';
-
-  return {
-    totalLines,
-    emptyLines,
-    commentLines,
-    codeLines,
-    functionCount,
-    complexityScore,
-    grade
-  };
-}
-
-// 🟢 Helper to delete a folder recursively
-function deleteFolderRecursive(directoryPath) {
-  if (fs.existsSync(directoryPath)) {
-    fs.readdirSync(directoryPath).forEach((file) => {
-      const curPath = path.join(directoryPath, file);
-      if (fs.lstatSync(curPath).isDirectory()) {
-        deleteFolderRecursive(curPath);
-      } else {
-        fs.unlinkSync(curPath);
-      }
-    });
-    fs.rmdirSync(directoryPath);
+// Clean up temp_repos on process exit to avoid leftover clones
+function cleanupTempRepos() {
+  if (fs.existsSync(tempReposDir)) {
+    fs.rmSync(tempReposDir, { recursive: true, force: true });
   }
 }
+process.on('SIGINT', () => { cleanupTempRepos(); process.exit(0); });
+process.on('SIGTERM', () => { cleanupTempRepos(); process.exit(0); });
+process.on('exit', cleanupTempRepos);
+
+// Session-isolated repository contexts for chat functionality (issue #59)
+const repoContexts = new Map();
+const CONTEXT_TTL = 30 * 60 * 1000; // 30 minutes
+
+// Periodic cleanup of stale contexts
+setInterval(() => {
+  const now = Date.now();
+  for (const [sessionId, entry] of repoContexts) {
+    if (now - entry.timestamp > CONTEXT_TTL) {
+      repoContexts.delete(sessionId);
+    }
+  }
+}, 60 * 1000);
+
+// Webhook deduplication state (module scope to persist across requests)
+const activeReviews = new Set();
+const processedDeliveries = new Map();
+const DELIVERY_TTL = 60 * 60 * 1000; // 1 hour
+
+// Periodic cleanup of expired delivery entries (TTL-based eviction)
+const dedupCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [deliveryId, timestamp] of processedDeliveries) {
+    if (now - timestamp > DELIVERY_TTL) {
+      processedDeliveries.delete(deliveryId);
+    }
+  }
+}, 60 * 1000);
+
+// Clean up timers on server shutdown
+process.on('SIGTERM', () => {
+  clearInterval(dedupCleanupTimer);
+});
+process.on('SIGINT', () => {
+  clearInterval(dedupCleanupTimer);
+});
 
 // 🟢 Route: GitHub Import & AI Review
-app.post('/api/analyze', requireApiKey, async (req, res) => {
+app.post('/api/analyze', requireApiKey, analyzeLimiter, async (req, res) => {
   const { repoUrl, company = 'General', language = 'English', model = 'llama-3.3-70b-versatile',temperature = 0.7,
-     maxTokens = 2048,systemPrompt = ''
+     maxTokens = 2048, systemPrompt = '', batchSize = 5
    } = req.body;
 
   if (!repoUrl) {
     return res.status(400).json({ error: 'GitHub Repository URL is required.' });
   }
 
+  if (!isValidRepoUrl(repoUrl)) {
+    return res.status(400).json({ error: 'Invalid GitHub repository URL. Only https://github.com/owner/repo URLs are allowed.' });
+  }
+
+  // Sanitize systemPrompt: limit length and strip dangerous directives
+  const sanitizePrompt = (prompt) => {
+    if (!prompt) return '';
+    const safe = String(prompt).slice(0, 2000);
+    const dangerous = ['ignore all', 'ignore previous', 'ignore above', 'forget all', 'forget previous', 'you are not', 'override all', 'disregard'];
+    let result = safe;
+    for (const phrase of dangerous) {
+      const idx = result.toLowerCase().indexOf(phrase);
+      if (idx !== -1) {
+        result = result.slice(0, idx) + result.slice(idx + phrase.length);
+      }
+    }
+    return result;
+  };
+  const validatedPrompt = sanitizePrompt(systemPrompt);
+
   // Generate unique folder name
-  const repoName = repoUrl.split('/').pop()?.replace('.git', '') || 'temp';
-  const uniqueId = Date.now();
+  const parsed = parseRepoUrl(repoUrl);
+  const repoName = parsed.repo;
+  const uniqueId = crypto.randomUUID();
   const clonePath = path.join(tempReposDir, `${repoName}_${uniqueId}`);
 
   console.log(`🚀 Cloning: ${repoUrl} into ${clonePath}`);
 
-  // Clone repo
-  exec(`git clone --depth 1 ${repoUrl} "${clonePath}"`, async (error) => {
-    if (error) {
-      console.error(`❌ Git Clone Error: ${error.message}`);
-      return res.status(500).json({ error: 'Failed to clone repository. Make sure the URL is public.' });
+  // Clone repo using simple-git to prevent shell injection and handle timeouts
+  try {
+    const cloneTimeout = parseInt(process.env.GIT_CLONE_TIMEOUT) || 120000;
+    const git = simpleGit({ timeout: { block: cloneTimeout } });
+    await git.clone(repoUrl, clonePath, ['--depth', '1']);
+
+    // Check repository size
+    const maxRepoSizeMB = parseInt(process.env.MAX_REPO_SIZE_MB) || 100;
+    const maxSizeBytes = maxRepoSizeMB * 1024 * 1024;
+    const repoSize = getFolderSize(clonePath);
+    
+    if (repoSize > maxSizeBytes) {
+      deleteFolderRecursive(clonePath);
+      return res.status(413).json({ error: `Repository exceeds the maximum allowed size of ${maxRepoSizeMB}MB.` });
     }
+  } catch (error) {
+    console.error(`❌ Git Clone Error: ${error.message}`);
+    deleteFolderRecursive(clonePath);
+    return res.status(500).json({ error: 'Failed to clone repository. Make sure the URL is public and within size limits.' });
+  }
 
     try {
       // 1. Load ignore patterns and read files
@@ -342,11 +198,12 @@ app.post('/api/analyze', requireApiKey, async (req, res) => {
         const aiResponse = await fetch(`${aiEngineUrl}/analyze`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ files, company, language, model,temperature,maxTokens, systemPrompt })
+          body: JSON.stringify({ files, company, language, model, temperature, maxTokens, systemPrompt: validatedPrompt, batchSize })
         });
         
         if (aiResponse.ok) {
           reviewResult = await aiResponse.json();
+          reviewResult._mock = false;
         } else {
           throw new Error('AI engine responded with error');
         }
@@ -385,22 +242,58 @@ app.post('/api/analyze', requireApiKey, async (req, res) => {
         });
       }
 
-      // 3. Cache the active repository context for chat
-      activeRepositoryContext = {
+      // 3. Cache the repository context for chat with session isolation
+      const sessionId = crypto.randomUUID();
+      repoContexts.set(sessionId, {
         repoUrl,
         repoName,
-        files
-      };
+        files,
+        timestamp: Date.now()
+      });
 
-      // 4. Clean up folder
+      // 4. Compute and persist analytics
+      let totalBugs = 0, totalSecurityIssues = 0, totalOptimizations = 0, totalStylingIssues = 0;
+      if (reviewResult && reviewResult.fileReviews) {
+        for (const file of Object.keys(reviewResult.fileReviews)) {
+          const review = reviewResult.fileReviews[file];
+          totalBugs += (review.bugs || []).length;
+          totalSecurityIssues += (review.security || []).length;
+          totalOptimizations += (review.optimization || []).length;
+          totalStylingIssues += (review.styling || []).length;
+        }
+      }
+      const totalFindings = totalBugs + totalSecurityIssues + totalOptimizations + totalStylingIssues;
+      const healthScore = Math.max(0, Math.round(100 - totalBugs * 5 - totalSecurityIssues * 3 - totalOptimizations * 1 - totalStylingIssues * 0.5));
+
+      try {
+        await Analytics.create({
+          repoUrl,
+          repoName,
+          filesReviewedCount: files.length,
+          totalBugs,
+          totalSecurityIssues,
+          totalOptimizations,
+          totalStylingIssues,
+          totalFindings,
+          healthScore,
+          language: language || 'General',
+          model: model || 'llama-3.3-70b-versatile',
+          analyzedAt: new Date(),
+        });
+      } catch (dbErr) {
+        console.warn('⚠️ Failed to persist analytics:', dbErr.message);
+      }
+
+      // 5. Clean up folder
       deleteFolderRecursive(clonePath);
       
-      // 5. Return result
+      // 6. Return result
       return res.json({
         success: true,
         repoName,
         filesReviewedCount: files.length,
-        analysis: reviewResult
+        analysis: reviewResult,
+        sessionId
       });
 
     } catch (err) {
@@ -408,20 +301,24 @@ app.post('/api/analyze', requireApiKey, async (req, res) => {
       deleteFolderRecursive(clonePath);
       return res.status(500).json({ error: 'An error occurred during repository analysis.' });
     }
-  });
 });
 
-// 🟢 Route: AI Chat with Repository
-app.post('/api/chat', requireApiKey, async (req, res) => {
-  const { message, history = [], model = 'llama-3.3-70b-versatile' } = req.body;
+// 🟢 Route: AI Chat with Repository (session-isolated per issue #59)
+app.post('/api/chat', requireApiKey, chatLimiter, async (req, res) => {
+  const { message, history = [], model = 'llama-3.3-70b-versatile', temperature = 0.7, maxTokens = 2048, systemPrompt = 'You are a helpful code reviewer.', sessionId } = req.body;
 
   if (!message) {
     return res.status(400).json({ error: 'Message is required.' });
   }
 
-  if (!activeRepositoryContext) {
-    return res.status(400).json({ error: 'No repository is currently active. Please analyze a repository first.' });
+  const context = sessionId ? repoContexts.get(sessionId) : null;
+  if (!context) {
+    const hint = !sessionId ? 'sessionId is missing from the request' : 'session expired';
+    return res.status(400).json({ error: `No repository is currently active or ${hint}. Please analyze a repository first.` });
   }
+
+  // Refresh TTL on access
+  context.timestamp = Date.now();
 
   const aiEngineUrl = process.env.AI_ENGINE_URL || 'http://localhost:8000';
 
@@ -430,7 +327,7 @@ app.post('/api/chat', requireApiKey, async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        files: activeRepositoryContext.files,
+        files: context.files,
         message,
         history,
         model,
@@ -452,48 +349,66 @@ app.post('/api/chat', requireApiKey, async (req, res) => {
     
     // Simple local fallback if Python FastAPI server is offline
     const responseMessage = `[Fallback Response] I see you are asking about: "${message}". Currently, the FastAPI AI Engine is offline, so I cannot analyze the full codebase for your query. Please make sure the AI Engine service is running on port 8000.`;
-    return res.json({ response: responseMessage });
+    return res.json({ response: responseMessage, sessionId, _mock: true, _mockWarning: 'AI Engine unavailable. Fallback response generated.' });
   }
 });
 
-function verifyWebhookSignature(rawBody, signature, secret) {
-  if (!signature || !secret) return false;
-  const sig = signature.startsWith('sha256=') ? signature : `sha256=${signature}`;
-  const hmac = crypto.createHmac('sha256', secret);
-  const digest = `sha256=${hmac.update(rawBody || '').digest('hex')}`;
-  try {
-    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(digest));
-  } catch {
-    return false;
-  }
-}
+
 
 // 🟢 Route: GitHub Webhook Receiver for automated Pull Request Reviews
 app.post('/api/webhook', async (req, res) => {
   const webhookSecret = process.env.WEBHOOK_SECRET;
-  if (webhookSecret) {
-    const signature = req.headers['x-hub-signature-256'];
-    if (!verifyWebhookSignature(req.rawBody, signature, webhookSecret)) {
-      console.warn('❌ Webhook signature verification failed');
-      return res.status(401).json({ error: 'Invalid webhook signature' });
-    }
+  if (!webhookSecret) {
+    console.error('❌ WEBHOOK_SECRET not configured');
+    return res.status(500).json({ error: 'Webhook secret not configured. Set WEBHOOK_SECRET in environment.' });
+  }
+
+  const signature = req.headers['x-hub-signature-256'];
+  if (!signature) {
+    return res.status(401).json({ error: 'Missing X-Hub-Signature-256 header.' });
+  }
+
+  if (!verifyWebhookSignature(req.rawBody, signature, webhookSecret)) {
+    console.warn('❌ Webhook signature verification failed');
+    return res.status(401).json({ error: 'Invalid webhook signature' });
   }
 
   const event = req.headers['x-github-event'];
   const payload = req.body;
 
   if (event === 'pull_request') {
+    // Deduplicate by X-GitHub-Delivery header
+    const deliveryId = req.headers['x-github-delivery'];
+    if (deliveryId) {
+      if (processedDeliveries.has(deliveryId)) {
+        console.log(`⏭️ Skipping duplicate webhook delivery: ${deliveryId}`);
+        return res.json({ success: true, message: 'Webhook received (duplicate skipped).' });
+      }
+      processedDeliveries.set(deliveryId, Date.now());
+    }
+
     const action = payload.action;
     if (action === 'opened' || action === 'synchronize') {
       const pullNumber = payload.pull_request.number;
       const owner = payload.repository.owner.login;
       const repo = payload.repository.name;
+      const reviewKey = `${owner}/${repo}/#${pullNumber}`;
       
       console.log(`📡 GitHub Webhook received: PR #${pullNumber} ${action} in ${owner}/${repo}`);
+      
+      // Skip if a review is already in progress for this PR
+      if (activeReviews.has(reviewKey)) {
+        console.log(`⏭️ Review already in progress for ${reviewKey}, skipping.`);
+        return res.json({ success: true, message: 'Webhook received (review in progress).' });
+      }
+      
+      activeReviews.add(reviewKey);
       
       // Execute code review asynchronously to prevent GitHub webhook timeout (10s)
       runWebhookReview(owner, repo, pullNumber).catch(err => {
         console.error(`❌ Async PR Review Error:`, err);
+      }).finally(() => {
+        activeReviews.delete(reviewKey);
       });
     }
   }
@@ -510,20 +425,39 @@ app.post('/api/issues/create', requireApiKey, async (req, res) => {
     return res.status(400).json({ error: 'GITHUB_PAT is not configured in backend/.env.' });
   }
 
-  if (!repoUrl || !title || !body) {
-    return res.status(400).json({ error: 'Repository URL, title, and body are required.' });
+  if (!title || typeof title !== 'string' || title.length < 1 || title.length > 256) {
+    return res.status(400).json({ error: 'Title is required and must be 1-256 characters.' });
+  }
+  if (!body || typeof body !== 'string' || body.length < 1 || body.length > 65536) {
+    return res.status(400).json({ error: 'Body is required and must be 1-65536 characters.' });
+  }
+  if (!Array.isArray(labels)) {
+    return res.status(400).json({ error: 'Labels must be an array.' });
+  }
+  if (labels.length > 10) {
+    return res.status(400).json({ error: 'Maximum 10 labels allowed.' });
+  }
+  for (const label of labels) {
+    if (typeof label !== 'string' || label.length > 50) {
+      return res.status(400).json({ error: 'Each label must be a string of at most 50 characters.' });
+    }
   }
 
   try {
-    // Extract owner and repo from URL (e.g., https://github.com/owner/repo)
-    const cleanUrl = repoUrl.replace('.git', '').replace(/\/$/, '');
-    const parts = cleanUrl.split('/');
-    const repo = parts.pop();
-    const owner = parts.pop();
-
-    if (!owner || !repo) {
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(repoUrl);
+    } catch {
+      return res.status(400).json({ error: 'Invalid GitHub repository URL.' });
+    }
+    if (parsedUrl.hostname !== 'github.com') {
+      return res.status(400).json({ error: 'URL must be a github.com repository.' });
+    }
+    const pathParts = parsedUrl.pathname.replace(/\.git$/, '').replace(/\/$/, '').split('/').filter(Boolean);
+    if (pathParts.length < 2) {
       return res.status(400).json({ error: 'Invalid GitHub repository URL structure.' });
     }
+    const [owner, repo] = pathParts;
 
     const octokit = new Octokit({ auth: token });
     
@@ -661,72 +595,22 @@ Please review my feedback and suggestions below. Happy coding! 🚀`,
 
 🎉 Outstanding work! I have scanned the PR and found **0 issues**. Your changes look pristine, clean, and optimized! Approved! 🚀`
     });
+
+    try {
+      await octokit.rest.issues.addLabels({
+        owner,
+        repo,
+        issue_number: pullNumber,
+        labels: ['gssoc:approved']
+      });
+      console.log('✅ Added gssoc:approved label to PR');
+    } catch (err) {
+      console.warn('⚠️ Could not add gssoc:approved label:', err.message);
+    }
   }
 }
 
-// 🟢 Helper for Mock AI Review (Provides instant feedback when python server is offline)
-function mockAIReview(files, model = 'llama-3.3-70b-versatile') {
-  const reviews = {};
-  
-  files.forEach(file => {
-    reviews[file.name] = {
-      bugs: [
-        {
-          type: "Null Pointer Risk",
-          line: 12,
-          description: `Variables should be validated before use to prevent potential runtime crashes in ${file.name}.`,
-          suggestion: "Add a standard null-check check (e.g. `if (!variable)` or `if variable is None`)."
-        }
-      ],
-      security: [
-        {
-          type: "Hardcoded API Key Check",
-          line: 5,
-          description: "Potential hardcoded credentials detected. API keys should always be loaded from environment variables (.env).",
-          suggestion: "Move the key to a `.env` file and load using standard environment managers."
-        }
-      ],
-      optimization: [
-        {
-          type: "Complexity Reduction",
-          line: 25,
-          description: "Avoid using nested iterations if time complexity grows quadratically. Consider using a Map/Dictionary lookup.",
-          suggestion: "Implement a mapping cache instead of performing dual-nested loops."
-        }
-      ],
-      styling: [
-        {
-          type: "Naming Convention",
-          line: 8,
-          description: "CamelCase or snake_case format mismatch detected on function declaration.",
-          suggestion: "Reformat variable or function definitions to conform to standard styling rules."
-        }
-      ]
-    };
-  });
 
-  // Mock generated README
-  const mockReadme = `# 🚀 ${files[0].name.split('/')[0] || 'My Repository'}
-
-This repository is powered by RepoSage AI Copilot (Audited using **${model}**). 
-
-## 🏗️ Folder Layout
-${files.map(f => `- 📄 **${f.name}**`).join('\n')}
-
-## 💻 Tech Stack
-- Source files: ${files.length} modules analyzed.
-
-Generated automatically by **RepoSage AI Generator**.`;
-
-  // Mock generated Mermaid flowchart
-  const mockMermaid = `graph TD\n  Root["📦 ${files[0].name.split('/')[0] || 'Repository'}"]\n  ${files.slice(0, 5).map((f, i) => `  Root --> File_${i}["📄 ${f.name.split('/').pop()}"]`).join('\n')}`;
-
-  return {
-    fileReviews: reviews,
-    generatedReadme: mockReadme,
-    mermaidDiagram: mockMermaid
-  };
-}
 
 // 🟢 Route: Export Review Report to HTML
 app.post('/api/reports/html', requireApiKey, (req, res) => {
@@ -750,12 +634,12 @@ app.post('/api/reports/html', requireApiKey, (req, res) => {
       allFindings.forEach(f => {
         fileRows += `
           <tr>
-            <td><strong>${file}</strong></td>
-            <td><span class="badge badge-${f.category.toLowerCase()}">${f.category}</span></td>
-            <td>${f.line}</td>
-            <td><strong>${f.type}</strong></td>
-            <td>${f.description}</td>
-            <td><code class="code-font">${f.suggestion.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</code></td>
+            <td><strong>${escapeHtml(file)}</strong></td>
+            <td><span class="badge badge-${escapeHtml(f.category).toLowerCase()}">${escapeHtml(f.category)}</span></td>
+            <td>${escapeHtml(String(f.line))}</td>
+            <td><strong>${escapeHtml(f.type)}</strong></td>
+            <td>${escapeHtml(f.description)}</td>
+            <td><code class="code-font">${escapeHtml(f.suggestion)}</code></td>
           </tr>
         `;
       });
@@ -767,7 +651,7 @@ app.post('/api/reports/html', requireApiKey, (req, res) => {
     <html lang="en">
     <head>
       <meta charset="UTF-8">
-      <title>RepoSage Code Audit - ${repoName}</title>
+      <title>RepoSage Code Audit - ${escapeHtml(repoName)}</title>
       <style>
         body {
           font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -847,7 +731,7 @@ app.post('/api/reports/html', requireApiKey, (req, res) => {
       <div class="container">
         <h1>🛡️ RepoSage AI Code Audit Report</h1>
         <div class="meta">
-          <strong>Repository Name:</strong> ${repoName}<br>
+          <strong>Repository Name:</strong> ${escapeHtml(repoName)}<br>
           <strong>Report Timestamp:</strong> ${new Date().toLocaleString()}<br>
           <strong>Audited with:</strong> RepoSage GSSoC '26 Audit Engine
         </div>
@@ -1006,6 +890,53 @@ app.post('/api/reports/pdf', requireApiKey, (req, res) => {
   }
 
   doc.end();
+});
+
+// 🟢 Route: Analytics Trends — 30-day time-series of repository health scores
+app.get('/api/analytics/trends', requireApiKey, async (req, res) => {
+  try {
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    const trends = await Analytics.aggregate([
+      {
+        $match: {
+          analyzedAt: { $gte: thirtyDaysAgo },
+        },
+      },
+      {
+        $group: {
+          _id: {
+            $dateToString: { format: '%Y-%m-%d', date: '$analyzedAt' },
+          },
+          analyses: { $sum: 1 },
+          totalFindings: { $sum: '$totalFindings' },
+          avgHealthScore: { $avg: '$healthScore' },
+          totalBugs: { $sum: '$totalBugs' },
+          totalSecurityIssues: { $sum: '$totalSecurityIssues' },
+        },
+      },
+      {
+        $sort: { _id: 1 },
+      },
+      {
+        $project: {
+          _id: 0,
+          date: '$_id',
+          analyses: 1,
+          totalFindings: 1,
+          avgHealthScore: { $round: ['$avgHealthScore', 1] },
+          totalBugs: 1,
+          totalSecurityIssues: 1,
+        },
+      },
+    ]);
+
+    return res.json({ trends });
+  } catch (err) {
+    console.error('❌ Analytics Trends Error:', err.message);
+    return res.status(500).json({ error: 'Failed to retrieve analytics trends.' });
+  }
 });
 
 app.listen(PORT, () => {
