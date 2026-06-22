@@ -1,11 +1,21 @@
 import * as vscode from "vscode";
+import { RepoSageWebviewProvider } from "./webviewProvider";
+import { reviewFileContent } from "./api";
 
 export function activate(context: vscode.ExtensionContext) {
   console.log("RepoSage extension is now active!");
 
+  const provider = new RepoSageWebviewProvider(context.extensionUri);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(
+      RepoSageWebviewProvider.viewType,
+      provider
+    )
+  );
+
   const disposable = vscode.commands.registerCommand(
     "reposage.reviewCurrentFile",
-    () => {
+    async () => {
       const editor = vscode.window.activeTextEditor;
       if (!editor) {
         vscode.window.showInformationMessage(
@@ -18,9 +28,25 @@ export function activate(context: vscode.ExtensionContext) {
       const fileName = document.fileName;
       const fileContent = document.getText();
 
-      console.log("RepoSage: Review Current File");
-      console.log("File:", fileName);
-      console.log("Content length:", fileContent.length, "characters");
+      provider.setLoading(true);
+      vscode.window.showInformationMessage(
+        `RepoSage: Reviewing ${fileName}...`
+      );
+
+      const result = await reviewFileContent(fileName, fileContent);
+
+      if (result.success) {
+        provider.setContent(result.response || "");
+        vscode.window.showInformationMessage(
+          "RepoSage review complete! Check the sidebar for details."
+        );
+      } else {
+        provider.setError(result.error || "Unknown error");
+        vscode.window.showErrorMessage(
+          `RepoSage review failed: ${result.error}`
+        );
+      }
+      provider.setLoading(false);
     }
   );
 
