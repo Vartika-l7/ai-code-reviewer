@@ -2,10 +2,6 @@
 import sys
 from unittest.mock import MagicMock, patch
 
-sys.modules['sentence_transformers'] = MagicMock()
-sys.modules['groq'] = MagicMock()
-sys.modules['chromadb'] = MagicMock()
-sys.modules['chromadb.config'] = MagicMock()
 
 # We removed the global mocks for vectorstore, rag, text_splitter 
 # because they leak into other test files like test_vectorstore.py
